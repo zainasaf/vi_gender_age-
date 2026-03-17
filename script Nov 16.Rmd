@@ -1,0 +1,396 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-11-07"
+---
+
+```{r}
+library(crunch)
+library(here)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+#install.packages("numerator")
+#library(numerator)
+library(nnet)
+library(tidyverse)
+library(purrr)
+library(srvyr)
+library(ggplot2)
+library(DT)
+library(lubridate)
+
+# if needed for numerator package
+ install.packages("remotes")
+# remotes::install_github("cchoe/numerator")
+
+# first time set up
+ if (!require(" #usethis")) install.packages("usethis")
+ usethis::edit_r_environ()
+ R_CRUNCH_API="https://moreincommon.crunch.io/api/"
+ R_CRUNCH_API_KEY="apk-SGjaXP9zHeIkEjB_dLQ7Mpj4ZY3rGEQqXuye57M-Ogk="
+
+# Load datasets from BOTH the main UK folder (2025) and the 2024 Datasets subfolder
+
+# Get 2025 datasets from main UK folder
+ds_name_2025 <- listDatasets(kind="all", project="UK", refresh=TRUE)
+
+# Get 2024 datasets from the subfolder
+ds_name_2024 <- listDatasets(kind="all", project="UK/2024 Datasets", refresh=TRUE)
+
+# Combine all datasets
+ds_name <- c(ds_name_2024, ds_name_2025)
+
+# Remove NNR datasets
+ds_name <- ds_name[!grepl("NNR", ds_name)]
+
+# Keep datasets from October 2024 to October 2025
+months_2024 <- paste0("24-", c("10", "11", "12"))
+months_2025 <- paste0("25-", c("01", "02", "03", "04", "05", "06", "07", "08", "09", "10"))
+keep_dates <- paste(c(months_2024, months_2025), collapse="|")
+
+ds_name <- ds_name[grep(keep_dates, ds_name)]
+
+# Filter: keep all 2024 OR (2025 with WO)
+ds_name <- ds_name[grepl("24-(10|11|12)", ds_name) | (grepl("^25-", ds_name) & grepl("WO", ds_name))]
+
+# Remove -CX--Default-SPSS suffix
+cx_ind <- grep("-CX--Default-SPSS", ds_name, fixed=TRUE)
+if(length(cx_ind) > 0){
+  ds_name <- ds_name[-cx_ind]
+}
+
+# Check results
+print(paste("Total datasets:", length(ds_name)))
+print(paste("2024 datasets:", sum(grepl("24-", ds_name))))
+print(paste("2025 datasets:", sum(grepl("25-", ds_name))))
+
+# Load the datasets
+ds_list <- list()  
+k <- 1
+for(i in seq_along(ds_name)){
+  # Determine which project to use based on dataset name
+  if(grepl("^24-", ds_name[i])){
+    project_path <- "UK/2024 Datasets"
+  } else {
+    project_path <- "UK"
+  }
+  
+  tmp <- try(loadDataset(ds_name[i], project=project_path, refresh=TRUE))
+  if(inherits(tmp, "try-error")){
+    message(paste0(ds_name[i], " failed to load.\n"))
+  } else {
+    ds_list[[k]] <- tmp  
+    names(ds_list)[k] <- ds_name[i] 
+    k <- k+1
+  }
+}
+
+
+ saveRDS(ds_list, "ds_list.rds")
+  
+ ds_list <- readRDS("ds_list.rds")
+ 
+## This is the date extraction - it looks at the START_DATE variable INSIDE each dataset
+
+for(i in seq_along(ds_list)){
+  unlock(ds_list[[i]])
+  
+  # Unhide START_DATE if it's hidden
+  if("START_DATE" %in% names(ds_list[[i]])){
+    tryCatch({
+      hiddenVariables(ds_list[[i]]) <- setdiff(hiddenVariables(ds_list[[i]]), "START_DATE")
+    }, error = function(e) {
+      message("Could not unhide START_DATE in dataset ", i)
+    })
+  }
+  
+# Now extract dates
+  tryCatch({
+    dates <- as.data.frame(as.vector(ds_list[[i]]$START_DATE))[,1]
+    dates <- as.Date(substr(dates, 1, 10))
+    start <- min(dates, na.rm = TRUE)
+    end <- max(dates, na.rm = TRUE)
+    
+    startDate(ds_list[[i]]) <- start
+    endDate(ds_list[[i]]) <- end
+  }, error = function(e) {
+    message("Error processing dates for dataset ", i, ": ", e$message)
+    # Use dataset name to extract date as fallback
+    date_from_name <- str_extract(names(ds_list)[i], "\\d{2}-\\d{2}")
+    if(!is.na(date_from_name)){
+      fallback_date <- dmy(paste0(date_from_name, "-2024"))
+      startDate(ds_list[[i]]) <- fallback_date
+      endDate(ds_list[[i]]) <- fallback_date
+      message("  Used fallback date from dataset name: ", fallback_date)
+    }
+  })
+}
+
+
+ds_info <- data.frame(
+  index = integer(),
+  name = character(),
+  start_date = as.Date(character()),
+  end_date = as.Date(character()),
+  stringsAsFactors = FALSE
+)
+
+null2na <- function(x)ifelse(is.null(x), NA, x)
+
+for(i in seq_along(ds_list)){
+  ds_info <- rbind(ds_info, data.frame(
+    index = i,
+    name = names(ds_list)[i],
+    start_date = null2na(startDate(ds_list[[i]])),
+    end_date = null2na(endDate(ds_list[[i]]))
+  ))
+}
+
+
+
+
+ds_info <- ds_info %>% arrange(desc(end_date))
+
+print(ds_info)
+
+saveRDS(ds_info, "ds_info.rds")
+
+ ds_info <- readRDS("ds_info.rds")
+
+
+## Downloading all the data - this part will take 30-40  mins as it is downloading all the relevant datasets
+
+df_list <- list()
+for(i in seq_along(ds_list)){
+  df_list[[i]] <- as.data.frame(ds_list[[i]], force=TRUE)
+}
+
+saveRDS(df_list, "df_list.rds")
+
+  
+ df_list <- readRDS("df_list.rds")
+ 
+
+# Function to calculate voting intention by gender-age 
+calculate_vote_by_gender_age <- function(df_list, ds_list) {
+  
+  voting_by_gender_age <- NULL
+  ## Has to be to votingintention_headline
+  ## making a vector of names for the voting and weight variables
+  vv <- c("voting_intention_headline", "votingintention_headline")
+  wv <- c("UKNatRepWeight", "GBnatrep", "uknatrep", "weightGB", 
+          "uknatrepweight", "GBNatRepWeight")
+  
+  for (i in seq_along(df_list)) {
+    ## remove dataset with very few observations in votingintention_headline
+    if(names(ds_list)[[i]] == "24-11a - Movember, Assisted Dying")next
+    # Determine which voting variable to use - check all possible variations
+    # use intersect() with vote variable names to find the first matching element
+    # it is a bit more compact than nested if-else statements. 
+    vote_var <- intersect(names(df_list[[i]]), vv)[1]
+    if(is.na(vote_var)){
+      message(paste("No voting_intention_headline variable in dataset ", i, ": ", 
+                    names(df_list)[i], " skipping dataset.\n", sep=""))
+      next
+    }
+    # using intersect to find available weight variables, choosing the first one
+    wtvar <- intersect(names(df_list[[i]]), wv)[1]
+    if(is.na(wtvar)){
+        message(paste("No weight variable in dataset ", i, ": ", 
+                      names(df_list)[i], " skipping dataset.\n", sep=""))
+        next  # Skip to next iteration
+    }
+      
+      # Get the date and ensure it's a Date object
+      dataset_date <- endDate(ds_list[[i]])
+      if(is.character(dataset_date)) {
+        dataset_date <- as.Date(dataset_date)
+      }
+      
+      # Calculate weighted tallies
+      voting_by_gender_age <- bind_rows(
+        voting_by_gender_age,
+        df_list[[i]] %>%
+          filter(!is.na(!!sym(vote_var))) %>%  
+          as_survey_design(weights = !!sym(wtvar)) %>%
+          filter(age_1 >= 18 & age_1 <= 28) %>%
+          group_by(gender, !!sym(vote_var)) %>%
+          survey_tally() %>%
+          mutate(
+            ds_number = i, 
+            dataset = names(df_list)[i],
+            date = dataset_date,  # Use the pre-converted date
+            weight = wtvar,
+            vote_variable = vote_var
+          )
+      )
+    }
+  return(voting_by_gender_age)  
+}
+
+voting_results <- calculate_vote_by_gender_age(df_list, ds_list)
+
+table(voting_results$date)
+print(voting_results)
+
+
+
+library(RcppRoll)
+library(lubridate)
+##voting_results %>% 
+##group_by(gender, votingintention_headline) %>% 
+##reframe(n = roll_sum(n, 3, align="right"))
+
+
+voting_results_roll <- voting_results %>% 
+  mutate(yearmon = gsub("(^\\d{2}-\\d{2}).*", "\\1", names(ds_list)[ds_number]), 
+         yearmon = lubridate::ym(yearmon)) %>% 
+  arrange(gender, votingintention_headline, date) %>%  # Make sure data is sorted by date
+  group_by(gender, votingintention_headline) %>% 
+  filter(n() >= 3) %>%  # Only calculate for groups with 3+ observations
+  reframe(
+    n = roll_sum(n, 3, align="right", fill = NA), 
+    start_num = roll_min(ds_number, 3, align="right", fill=NA), 
+    end_num = roll_max(ds_number, 3, align="right", fill=NA),
+    start = roll_min(as.numeric(as.Date(date)), 3, align="right", fill = NA), 
+    end = roll_max(as.numeric(as.Date(date)), 3, align="right", fill = NA)
+  ) %>% 
+  filter(!is.na(n)) %>%  # Remove rows where rolling sum couldn't be calculated
+  mutate(
+    start = as.Date(start, origin = "1970-01-01"),  # Convert back to Date
+    end = as.Date(end, origin = "1970-01-01")       # Convert back to Date
+  ) %>%
+  group_by(gender, start) %>% 
+  mutate(pct = n/sum(n) * 100, 
+         yrmon1 = ym(sprintf("%s-%s", year(start), month(start))), 
+         yrmon2 = ym(gsub("^(\\d{2}-\\d{2}).*", "\\1", names(ds_list)[[start_num[1]]])),
+         yrmon = coalesce(yrmon1, yrmon2)) %>% 
+  select(-c(yrmon1, yrmon2)) %>% 
+  ungroup()
+
+voting_results_roll_yrmon <- voting_results_roll %>% 
+  group_by(gender, votingintention_headline, yrmon) %>% 
+  summarise(pct = mean(pct))
+
+ggplot(voting_results_roll_yrmon, 
+       aes(x=yrmon, y=pct, color=gender)) + 
+  geom_line() + 
+  facet_wrap(~votingintention_headline) + 
+  theme_bw()
+
+print(voting_results_roll_yrmon)
+
+write.csv(voting_results_roll_yrmon, "voting_results_roll_yrmon.csv")
+
+
+## only surveys starting in ocotebr
+voting_results_roll %>% 
+  filter(start > as.Date("2024-10-01"))
+  
+## need to go back to 2024 octoebr - need to change - 278
+
+# last two polls in sept and first poll in octoebr
+##voting_results_roll %>% 
+##  filter(end > as.Date("2025-10-01"))
+
+```
+
+labour_men_2 <-voting_results %>% filter(gender=="Male", votingintention_headline=="Labour")
+
+labour_men_3 <- voting_results %>% filter(date == as.Date("2024-11-11"))
+
+
+library(ggplot2)
+
+# Filter for data starting from October 2024
+voting_plot_data <- voting_results_roll %>%
+  filter(start > as.Date("2024-10-01"))
+
+# Create the plot
+ggplot(voting_plot_data, aes(x = end, y = pct, color = votingintention_headline)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ gender, ncol = 1) +  # Separate panels for Male/Female
+  labs(
+    title = "Voting Intention by Gender (3-Week Rolling Average)",
+    subtitle = "Young voters aged 18-28, October 2024 onwards",
+    x = "Date (End of Rolling Period)",
+    y = "Percentage (%)",
+    color = "Party"
+  ) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+# Save the plot
+ggsave("voting_intention_by_gender.png", 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+
+
+library(ggplot2)
+
+# Filter for data starting from October 2024 and exclude certain parties
+voting_results_roll_yrmon <- voting_results_roll_yrmon %>%
+# filter(start > as.Date("2024-10-01")) %>%
+  filter(!votingintention_headline %in% c("Scottish National Party (SNP)", 
+                                          "Plaid Cymru", 
+                                          "Another party",
+                                          "Another party/Independent candidate",
+                                          "Another party/Independent Candidate"))
+
+# Define UK party colors (official hex codes)
+party_colors <- c(
+  "Conservative" = "#0087DC",      # Conservative Blue
+  "Labour" = "#E4003B",            # Labour Red
+  "Liberal Democrat" = "#FAA61A",   # Lib Dem Orange/Yellow
+  "The Green Party" = "#6AB023",   # Green
+  "Reform UK" = "#12B6CF"          # Reform Turquoise
+)
+
+# Create the plot
+ggplot(voting_results_roll_yrmon, aes(x = yrmon, y = pct, color = votingintention_headline)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ gender, ncol = 1) +
+  scale_color_manual(values = party_colors) +  # Use official party colors
+  labs(
+    title = "Voting Intention by Gender (3-Week Rolling Average)",
+    subtitle = "Young voters aged 18-28, October 2024 onwards",
+    x = "Date (End of Rolling Period)",
+    y = "Percentage (%)",
+    color = "Party"
+  ) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  scale_y_continuous(limits = c(0, NA), breaks = seq(0, 60, by = 10)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+labour_men <- voting_plot_data %>% filter(gender =="Male" & votingintention_headline =="Labour")
+
+
+# Save the plot
+ggsave("voting_intention_by_gender.png", 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
